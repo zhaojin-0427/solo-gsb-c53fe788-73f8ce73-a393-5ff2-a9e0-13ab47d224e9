@@ -1,0 +1,7 @@
+data/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+tests/
+scripts/

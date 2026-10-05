@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>增量构建裁决台</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2233; --border: #2a3550; --text: #dbe4f5;
+    --muted: #8595b5; --green: #34d399; --amber: #fbbf24; --blue: #60a5fa;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--border);
+           position: sticky; top: 0; z-index: 10; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  .stat { padding: 3px 12px; border-radius: 12px; font-size: 13px;
+          background: #232d45; border: 1px solid var(--border); }
+  .stat b { font-size: 15px; }
+  .c-reusable b { color: var(--green); } .c-waiting b { color: var(--amber); }
+  .c-executable b { color: var(--blue); }
+  #conn { margin-left: auto; color: var(--muted); font-size: 12px; }
+  button { background: #2b3a5c; color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #35476e; }
+  .toolbar { display: flex; gap: 10px; padding: 12px 20px; align-items: center;
+             flex-wrap: wrap; }
+  .tabs { display: flex; gap: 4px; }
+  .tabs button.active { background: var(--blue); color: #0b1020; font-weight: 600; }
+  input[type=search] { background: #141b2c; border: 1px solid var(--border);
+                       color: var(--text); border-radius: 6px; padding: 6px 10px;
+                       width: 280px; }
+  main { display: flex; gap: 16px; padding: 0 20px 20px; align-items: flex-start; }
+  #list { flex: 1; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 55px;
+       background: var(--bg); }
+  tr:hover td { background: #1c2740; cursor: pointer; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 12px; }
+  .b-reusable { background: rgba(52,211,153,.15); color: var(--green); }
+  .b-waiting { background: rgba(251,191,36,.15); color: var(--amber); }
+  .b-executable { background: rgba(96,165,250,.15); color: var(--blue); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  #detail { width: 380px; flex-shrink: 0; background: var(--panel);
+            border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px;
+            position: sticky; top: 65px; max-height: calc(100vh - 90px); overflow: auto; }
+  #detail h2 { font-size: 14px; margin: 0 0 10px; word-break: break-all; }
+  .chain-node { border-left: 3px solid var(--border); padding: 6px 10px; margin: 6px 0;
+                background: #141b2c; border-radius: 0 6px 6px 0; }
+  .chain-node.root { border-left-color: var(--red); }
+  .kv { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .kv span { color: var(--text); }
+  #empty { color: var(--muted); padding: 30px; text-align: center; }
+  #log { font-size: 12px; color: var(--muted); padding: 0 20px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>增量构建裁决台</h1>
+  <span class="stat c-reusable">可复用 <b id="n-reusable">0</b></span>
+  <span class="stat c-waiting">待上游 <b id="n-waiting">0</b></span>
+  <span class="stat c-executable">可执行 <b id="n-executable">0</b></span>
+  <button id="btn-demo">导入演示数据</button>
+  <span id="conn">连接中…</span>
+</header>
+<div class="toolbar">
+  <div class="tabs">
+    <button data-f="all" class="active">全部变动</button>
+    <button data-f="reusable">可复用</button>
+    <button data-f="waiting">待上游</button>
+    <button data-f="executable">可执行</button>
+  </div>
+  <input type="search" id="search" placeholder="按任务 ID 过滤…">
+  <label style="color:var(--muted);font-size:13px">
+    <input type="checkbox" id="autopoll" checked> 自动刷新
+  </label>
+</div>
+<div id="log"></div>
+<main>
+  <div id="list">
+    <table>
+      <thead><tr><th>任务</th><th>裁决</th><th>失效原因</th><th>链长</th><th>seq</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" style="display:none">暂无数据 — 点击「导入演示数据」或通过 API 导入任务图。</div>
+  </div>
+  <div id="detail" style="display:none"></div>
+</main>
+<script>
+"use strict";
+const state = {
+  seq: 0, epoch: 0, filter: "all", search: "",
+  tasks: new Map(),   // task_id -> {state, reason, reason_task_id, depth, seq}
+  counts: {},
+};
+const STATE_LABEL = { reusable: "可复用", waiting: "待上游", executable: "可执行" };
+const REASON_LABEL = {
+  definition_changed: "定义变更",
+  source_changed: "源文件变更",
+  upstream_waiting: "等待上游",
+  upstream_changed: "上游产物变更",
+};
+const MAX_ROWS = 500;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+async function poll() {
+  try {
+    const p = await api("/api/plan?since=" + state.seq);
+    if (p.epoch !== state.epoch) {           // 重新导入过，整体重置
+      state.tasks.clear();
+      state.seq = 0;
+      return resetAndPoll();
+    }
+    applyPlan(p);
+    document.getElementById("conn").textContent =
+      "已连接 · seq " + p.seq + " · epoch " + p.epoch;
+  } catch (e) {
+    document.getElementById("conn").textContent = "连接失败，重试中…";
+  }
+}
+
+async function resetAndPoll() {
+  const p = await api("/api/plan?since=0");
+  state.epoch = p.epoch;
+  applyPlan(p);
+}
+
+function applyPlan(p) {
+  state.epoch = p.epoch;
+  state.seq = p.seq;
+  state.counts = p.counts;
+  for (const c of p.changes) {
+    state.tasks.set(c.task_id, c);
+  }
+  render();
+}
+
+function render() {
+  for (const s of ["reusable", "waiting", "executable"]) {
+    document.getElementById("n-" + s).textContent = state.counts[s] || 0;
+  }
+  const q = state.search.toLowerCase();
+  const rows = [];
+  for (const [id, t] of state.tasks) {
+    if (state.filter !== "all" && t.state !== state.filter) continue;
+    if (q && !id.toLowerCase().includes(q)) continue;
+    rows.push([id, t]);
+  }
+  rows.sort((a, b) => b[1].seq - a[1].seq);
+  const total = rows.length;
+  const shown = rows.slice(0, MAX_ROWS);
+  document.getElementById("empty").style.display =
+    state.tasks.size === 0 ? "" : "none";
+  document.getElementById("rows").innerHTML = shown.map(([id, t]) =>
+    `<tr data-id="${esc(id)}"><td class="mono">${esc(id)}</td>` +
+    `<td><span class="badge b-${t.state}">${STATE_LABEL[t.state] || t.state}</span></td>` +
+    `<td>${t.reason ? (REASON_LABEL[t.reason] || t.reason) +
+       (t.reason_task_id ? ' → <span class="mono">' + esc(t.reason_task_id) + '</span>' : '') : '—'}</td>` +
+    `<td>${t.reason ? t.depth : '—'}</td><td class="mono">${t.seq}</td></tr>`
+  ).join("");
+  document.getElementById("log").textContent =
+    `当前视图 ${shown.length} / ${total} 条变动（共跟踪 ${state.tasks.size} 项任务）`;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function showDetail(id) {
+  const box = document.getElementById("detail");
+  box.style.display = "";
+  box.innerHTML = "<h2>" + esc(id) + "</h2><div class='kv'>加载中…</div>";
+  try {
+    const [t, ch] = await Promise.all([
+      api("/api/tasks/" + encodeURIComponent(id)),
+      api("/api/tasks/" + encodeURIComponent(id) + "/chain"),
+    ]);
+    let html = "<h2>" + esc(id) + "</h2>";
+    html += `<div class="kv">裁决：<span class="badge b-${t.state}">${STATE_LABEL[t.state]}</span></div>`;
+    html += `<div class="kv">产物摘要：<span class="mono">${esc(t.artifact_digest.slice(0, 20))}…</span></div>`;
+    html += `<div class="kv">依赖 ${t.deps.length} 项 · 被 ${t.dependents.length} 项依赖</div>`;
+    html += "<h2 style='margin-top:14px'>最短失效原因链</h2>";
+    if (t.state === "reusable") {
+      html += "<div class='kv'>输入全部匹配，可复用上次结果。</div>";
+    } else {
+      html += ch.chain.map((n, i) => {
+        const last = i === ch.chain.length - 1;
+        return `<div class="chain-node ${last ? 'root' : ''}">` +
+          `<div class="mono">${esc(n.task_id)}</div>` +
+          `<div class="kv">${STATE_LABEL[n.state] || n.state} · ` +
+          `${n.reason ? (REASON_LABEL[n.reason] || n.reason) : ''}</div></div>`;
+      }).join("");
+    }
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = "<h2>" + esc(id) + "</h2><div class='kv'>加载失败</div>";
+  }
+}
+
+document.getElementById("rows").addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-id]");
+  if (tr) showDetail(tr.dataset.id);
+});
+document.querySelectorAll(".tabs button").forEach(b =>
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    state.filter = b.dataset.f;
+    render();
+  }));
+document.getElementById("search").addEventListener("input", e => {
+  state.search = e.target.value;
+  render();
+});
+document.getElementById("btn-demo").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-demo");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/demo", { method: "POST" });
+    state.tasks.clear(); state.seq = 0;
+    await resetAndPoll();
+  } finally { btn.disabled = false; }
+});
+
+resetAndPoll();
+setInterval(() => {
+  if (document.getElementById("autopoll").checked) poll();
+}, 1000);
+</script>
+</body>
+</html>

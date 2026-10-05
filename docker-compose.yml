@@ -1,0 +1,11 @@
+services:
+  adjudicator:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - adjudicator-data:/data
+    restart: unless-stopped
+
+volumes:
+  adjudicator-data:
