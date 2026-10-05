@@ -102,8 +102,14 @@ def report(payload: dict = Body(...)):
         fingerprint = payload["input_fingerprint"]
         reads = payload.get("reads", [])
         artifact = str(payload["artifact_digest"])
+        if (not isinstance(task_id, str) or not isinstance(fingerprint, str)
+                or not isinstance(reads, list)
+                or not all(isinstance(r, dict) and r.get("upstream") is not None
+                           for r in reads)):
+            return JSONResponse({"status": "error", "error": "invalid_payload"}, 400)
     except (KeyError, TypeError):
         return JSONResponse({"status": "error", "error": "invalid_payload"}, 400)
-    status, detail = core.report_result(conn(), task_id, fingerprint, reads, artifact)
+    status, detail = core.report_result(
+        conn(), task_id, fingerprint, reads, artifact)
     code = {"accepted": 200, "stale": 409}.get(status, 400)
     return JSONResponse({"status": status, **detail}, code)

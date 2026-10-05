@@ -327,8 +327,30 @@ def _creates_cycle(conn, start):
 def report_result(conn, task_id, fingerprint, reads, artifact_digest):
     """Apply one execution report atomically.
 
+    Validity is adjudicated from the task's *current* state, the fingerprint
+    handed out at claim time and the digests of the artifacts the worker says
+    it actually read:
+
+    * the task must currently be ``executable`` -- a re-report after the task
+      was already completed is a duplicate and is refused as ``stale`` (a first
+      report marks the task reusable without changing the fingerprint, which is
+      exactly what previously let an old fingerprint overwrite the plan);
+    * the claim fingerprint must still equal the fingerprint of the current
+      definition, source digest and registered upstream artifacts;
+    * every read must reference an existing upstream task
+      (``missing_dependency``) and its digest must equal that upstream's
+      current artifact digest -- merely knowing the task id is not enough, a
+      wrong digest proves the report is based on stale inputs (``stale``).
+
+    Only when every gate passes are deps rewritten.  A dependency key that is
+    both a static row and a read this run keeps its static identity: its
+    ``read_digest`` is updated on the static row instead of being inserted a
+    second time as a dynamic row (which would hit the primary key).  The
+    dynamic set is replaced wholesale by the reads that are not static keys.
+
     Returns ``(status, detail)`` where status is "accepted", "stale" or one of
-    the error codes.  Any failure rolls the whole report back.
+    the error codes.  Every failure rolls the whole report back, so tasks,
+    deps, downstream verdicts and change sequence numbers are untouched.
     """
     with db.write_lock:
         conn.execute("BEGIN IMMEDIATE")
@@ -339,8 +361,17 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
                 conn.rollback()
                 return "unknown_task", {"task_id": task_id}
 
+            # gate 1: an already completed task cannot accept another report;
+            # a waiting task has not been claimed legitimately either.
+            if row["state"] != EXECUTABLE:
+                conn.rollback()
+                return "stale", {"task_id": task_id,
+                                 "reason": "already_reported",
+                                 "state": row["state"]}
+
+            # gate 2: recompute the fingerprint from current inputs
             deps = conn.execute(
-                "SELECT d.upstream_id, t.artifact_digest FROM deps d "
+                "SELECT d.upstream_id, d.kind, t.artifact_digest FROM deps d "
                 "JOIN tasks t ON t.task_id = d.upstream_id WHERE d.task_id=?",
                 (task_id,)).fetchall()
             current_fp = input_fingerprint(
@@ -349,30 +380,59 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
             if current_fp != fingerprint:
                 conn.rollback()
                 return "stale", {"task_id": task_id,
+                                 "reason": "fingerprint_mismatch",
                                  "current_fingerprint": current_fp}
 
-            # validate newly discovered dynamic dependencies
+            # normalise the actually-read set (duplicate key -> last wins)
             new_reads = {}
             for r in reads:
                 up = str(r["upstream"])
                 new_reads[up] = str(r.get("digest", ""))
+
+            # gate 3a: every read upstream must exist
             if new_reads:
                 marks = ",".join("?" * len(new_reads))
-                found = {r[0] for r in conn.execute(
-                    f"SELECT task_id FROM tasks WHERE task_id IN ({marks})",
-                    tuple(new_reads))}
-                missing = sorted(set(new_reads) - found)
+                current_artifacts = dict(conn.execute(
+                    f"SELECT task_id, artifact_digest FROM tasks "
+                    f"WHERE task_id IN ({marks})", tuple(new_reads)))
+                missing = sorted(set(new_reads) - set(current_artifacts))
                 if missing:
                     conn.rollback()
                     return "missing_dependency", {"missing": missing}
+            else:
+                current_artifacts = {}
 
-            # swap dynamic deps for the actually-read set
+            # gate 3b: the digest actually read must be the upstream's current
+            # artifact digest, otherwise this report is based on stale inputs.
+            bad_digest = sorted(
+                up for up, digest in new_reads.items()
+                if digest != current_artifacts[up])
+            if bad_digest:
+                conn.rollback()
+                return "stale", {"task_id": task_id,
+                                 "reason": "read_digest_mismatch",
+                                 "upstreams": bad_digest}
+
+            # ---- all gates passed: rewrite dependency rows -------------------
+            # static keys among the reads keep their static identity and only
+            # refresh the historical read_digest; every other read becomes a
+            # dynamic dep.  Static rows that were not read are left untouched.
+            static_rows = {d["upstream_id"]: d for d in deps
+                           if d["kind"] == "static"}
+            static_reads = {up: digest for up, digest in new_reads.items()
+                            if up in static_rows}
+            dynamic_reads = {up: digest for up, digest in new_reads.items()
+                             if up not in static_rows}
+            conn.executemany(
+                "UPDATE deps SET read_digest=? "
+                "WHERE task_id=? AND upstream_id=? AND kind='static'",
+                [(digest, task_id, up) for up, digest in static_reads.items()])
             conn.execute(
                 "DELETE FROM deps WHERE task_id=? AND kind='dynamic'", (task_id,))
             conn.executemany(
                 "INSERT INTO deps(task_id, upstream_id, kind, read_digest) "
                 "VALUES (?,?, 'dynamic', ?)",
-                [(task_id, up, digest) for up, digest in new_reads.items()])
+                [(task_id, up, digest) for up, digest in dynamic_reads.items()])
 
             if new_reads and _creates_cycle(conn, task_id):
                 conn.rollback()

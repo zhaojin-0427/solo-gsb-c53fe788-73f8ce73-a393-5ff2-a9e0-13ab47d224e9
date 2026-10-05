@@ -17,11 +17,13 @@ def fresh_conn():
 
 
 def task(tid, deps=(), def_v=1, src_v=1, prev_def_v=None, prev_src_v=None,
-         artifact=None, dynamic=False):
+         artifact=None, dynamic=False, read_digests=None):
     """Build an import item; deps are upstream ids whose artifacts are 'art:<id>'."""
     prev_def_v = def_v if prev_def_v is None else prev_def_v
     prev_src_v = src_v if prev_src_v is None else prev_src_v
-    dep_list = [{"upstream": u, "read_digest": f"art:{u}"} for u in deps]
+    read_digests = read_digests or {}
+    dep_list = [{"upstream": u, "read_digest": read_digests.get(u, f"art:{u}")}
+                for u in deps]
     return {
         "id": tid,
         "definition": f"def:{tid}:v{def_v}",
@@ -96,6 +98,38 @@ def test_upstream_artifact_change_invalidates_downstream():
     assert [n["task_id"] for n in chain] == ["c", "b", "a"]
 
 
+def test_completed_task_rereport_rejected_even_with_old_fingerprint():
+    """The first report flips the task reusable without changing its
+    fingerprint, so a duplicate report carrying that same fingerprint used to
+    be accepted again -- potentially with a different artifact, silently
+    rewriting the downstream plan.  It must now be refused as stale."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("a", src_v=2, prev_src_v=1), task("b", ["a"]),
+    ])
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(conn, "a", claim_a["input_fingerprint"],
+                                   [], "art:a:X")
+    assert status == "accepted"
+    before_seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    before_b = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
+
+    # re-report with the still-valid claim fingerprint but another artifact
+    status, detail = core.report_result(conn, "a", claim_a["input_fingerprint"],
+                                        [], "art:a:Y")
+    assert status == "stale"
+    assert detail["reason"] == "already_reported"
+
+    # task, downstream plan and change seq are all untouched
+    assert conn.execute(
+        "SELECT artifact_digest FROM tasks WHERE task_id='a'").fetchone()[0] \
+        == "art:a:X"
+    after_b = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
+    assert dict(before_b) == dict(after_b)
+    assert conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] \
+        == before_seq
+
+
 def test_stale_report_rejected_without_state_change():
     conn, _ = fresh_conn()
     core.import_graph(conn, [
@@ -106,15 +140,103 @@ def test_stale_report_rejected_without_state_change():
     core.report_result(conn, "a", claim_a["input_fingerprint"], [], "art:a:X")
     claim_b, err = core.claim(conn, "b")
     assert err is None                      # b's own sources changed: executable
-    # a slow duplicate worker re-reports a (its inputs unchanged -> fingerprint
-    # still valid) but yields a different artifact -> b's claim is now stale
-    core.report_result(conn, "a", claim_a["input_fingerprint"], [], "art:a:Y")
+    # a's artifact moves on again without a new claim (e.g. a newer upstream
+    # build): the fingerprint handed to b is now stale
+    conn.execute("UPDATE tasks SET artifact_digest='art:a:Y' WHERE task_id='a'")
+    core._propagate(conn, core._ChangeLog(conn), ["a"])
     before = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
-    status, _ = core.report_result(conn, "b", claim_b["input_fingerprint"],
-                                   [], "art:b:NEW")
+    before_seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    status, detail = core.report_result(conn, "b", claim_b["input_fingerprint"],
+                                        [{"upstream": "a", "digest": "art:a:X"}],
+                                        "art:b:NEW")
     assert status == "stale"
+    assert detail["reason"] == "fingerprint_mismatch"
     after = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
     assert dict(before) == dict(after)      # no state change at all
+    assert conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] \
+        == before_seq                        # no change rows either
+
+
+def test_wrong_read_digest_rejected_without_side_effects():
+    """reads are validated against the upstream's *current* artifact digest;
+    merely naming an existing upstream is not enough."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", src_v=2, prev_src_v=1),
+        task("a", ["x"], dynamic=True, src_v=2, prev_src_v=1),
+    ])
+    # x reruns and produces a different artifact -> a is still waiting
+    claim_x, _ = core.claim(conn, "x")
+    core.report_result(conn, "x", claim_x["input_fingerprint"], [], "art:x:v2")
+    # a becomes executable; a stale worker still believes x's old digest
+    claim_a, _ = core.claim(conn, "a")
+    before_seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    status, detail = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"}], "art:a:NEW")
+    assert status == "stale"
+    assert detail["reason"] == "read_digest_mismatch"
+    assert detail["upstreams"] == ["x"]
+    # nothing was written: the stale dynamic row survives unchanged, the task
+    # stays executable and no new change row was appended
+    dep = conn.execute(
+        "SELECT kind, read_digest FROM deps WHERE task_id='a'").fetchone()
+    assert dep["kind"] == "dynamic" and dep["read_digest"] == "art:x"
+    assert states(conn)["a"] == "executable"
+    assert conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] \
+        == before_seq
+
+
+def test_static_read_keeps_static_identity_and_refreshes_digest():
+    """A static dependency that appears in this run's reads stays a static
+    row; its historical read_digest is updated and no duplicate dynamic row is
+    inserted for the same key."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", src_v=2, prev_src_v=1),
+        task("a", ["x"], src_v=2, prev_src_v=1,
+             read_digests={"x": "art:x:OLD"}),
+    ])
+    claim_x, _ = core.claim(conn, "x")
+    core.report_result(conn, "x", claim_x["input_fingerprint"], [], "art:x")
+    # stored read digest was the stale "art:x:OLD" -> a executable
+    assert states(conn)["a"] == "executable"
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"}], "art:a:NEW")
+    assert status == "accepted"
+    deps = conn.execute(
+        "SELECT upstream_id, kind, read_digest FROM deps WHERE task_id='a'").fetchall()
+    assert [(d["upstream_id"], d["kind"], d["read_digest"]) for d in deps] == \
+        [("x", "static", "art:x")]
+    assert states(conn)["a"] == "reusable"
+
+
+def test_mixed_static_and_dynamic_reads_share_key_safely():
+    """Static dep x plus newly discovered dynamic dep y reported together:
+    x stays static (digest refreshed), y is the only dynamic row -- the old
+    code attempted to insert x twice and failed with a primary-key error."""
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", src_v=2, prev_src_v=1), task("y"),
+        task("a", ["x"], src_v=2, prev_src_v=1,
+             read_digests={"x": "art:x:OLD"}),
+    ])
+    claim_x, _ = core.claim(conn, "x")
+    core.report_result(conn, "x", claim_x["input_fingerprint"], [], "art:x")
+    claim_a, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim_a["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"},
+         {"upstream": "y", "digest": "art:y"}],
+        "art:a:NEW")
+    assert status == "accepted"
+    deps = conn.execute(
+        "SELECT upstream_id, kind, read_digest FROM deps WHERE task_id='a' "
+        "ORDER BY upstream_id").fetchall()
+    assert [(d["upstream_id"], d["kind"], d["read_digest"]) for d in deps] == \
+        [("x", "static", "art:x"), ("y", "dynamic", "art:y")]
 
 
 def test_cycle_report_rolls_back():
