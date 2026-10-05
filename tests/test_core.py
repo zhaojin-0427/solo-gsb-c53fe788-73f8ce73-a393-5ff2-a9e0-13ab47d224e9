@@ -106,15 +106,178 @@ def test_stale_report_rejected_without_state_change():
     core.report_result(conn, "a", claim_a["input_fingerprint"], [], "art:a:X")
     claim_b, err = core.claim(conn, "b")
     assert err is None                      # b's own sources changed: executable
-    # a slow duplicate worker re-reports a (its inputs unchanged -> fingerprint
-    # still valid) but yields a different artifact -> b's claim is now stale
-    core.report_result(conn, "a", claim_a["input_fingerprint"], [], "art:a:Y")
-    before = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
+    # a slow duplicate worker re-reports a: a is already reusable. Its carried
+    # fingerprint may even be unchanged (a's first report kept the same
+    # upstream set), but the replay must be rejected as stale instead of
+    # accepting a different artifact and rewriting b's plan.
+    before_a = conn.execute("SELECT * FROM tasks WHERE task_id='a'").fetchone()
+    before_b = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
+    seq_before = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    status, detail = core.report_result(
+        conn, "a", claim_a["input_fingerprint"], [], "art:a:Y")
+    assert status == "stale"
+    after_a = conn.execute("SELECT * FROM tasks WHERE task_id='a'").fetchone()
+    after_b = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
+    seq_after = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    assert dict(before_a) == dict(after_a)      # no state change at all
+    assert dict(before_b) == dict(after_b)
+    assert seq_before == seq_after              # no change records appended
+    assert detail["state"] == "reusable"
+    # b's original claim is still valid and its report goes through
     status, _ = core.report_result(conn, "b", claim_b["input_fingerprint"],
                                    [], "art:b:NEW")
+    assert status == "accepted"
+
+
+def test_wrong_read_digest_rejected_without_state_change():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x"),
+        task("a", ["x"], src_v=2, prev_src_v=1),
+    ])
+    claim, _ = core.claim(conn, "a")
+    before = dict(conn.execute(
+        "SELECT * FROM tasks WHERE task_id='a'").fetchone())
+    deps_before = conn.execute(
+        "SELECT * FROM deps WHERE task_id='a'").fetchall()
+    seq_before = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    # x exists, but the reported digest does not match its registered artifact
+    status, detail = core.report_result(
+        conn, "a", claim["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x:TAMPERED"}], "art:a:NEW")
     assert status == "stale"
-    after = conn.execute("SELECT * FROM tasks WHERE task_id='b'").fetchone()
-    assert dict(before) == dict(after)      # no state change at all
+    assert detail["mismatched_reads"] == ["x"]
+    after = dict(conn.execute(
+        "SELECT * FROM tasks WHERE task_id='a'").fetchone())
+    assert before == after
+    assert {tuple(r) for r in deps_before} == {
+        tuple(r) for r in conn.execute(
+            "SELECT * FROM deps WHERE task_id='a'").fetchall()}
+    assert conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] == seq_before
+    assert states(conn)["a"] == "executable"
+
+
+def test_static_read_keeps_static_identity_and_refreshes_digest():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x", artifact="art:x:OLD"),
+        # a statically reads x but previously read an older artifact digest
+        {**task("a", ["x"], src_v=2, prev_src_v=1),
+         "static_deps": [{"upstream": "x", "read_digest": "art:x:OLD"}]},
+    ])
+    # x is reusable with its new artifact; a is executable via own source
+    claim, _ = core.claim(conn, "a")
+    status, _ = core.report_result(
+        conn, "a", claim["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x:OLD"}], "art:a:NEW")
+    assert status == "accepted"
+    rows = conn.execute(
+        "SELECT upstream_id, kind, read_digest FROM deps WHERE task_id='a'"
+    ).fetchall()
+    # the read overlaps the static key: no dynamic duplicate row is inserted
+    assert [(r["upstream_id"], r["kind"], r["read_digest"]) for r in rows] == \
+        [("x", "static", "art:x:OLD")]
+
+
+def test_static_and_dynamic_reads_coexist_without_unique_violation():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x"), task("y"),
+        task("a", ["x"], src_v=2, prev_src_v=1),
+    ])
+    claim, _ = core.claim(conn, "a")
+    # x is both a static dep and reported in reads; y is newly discovered
+    status, _ = core.report_result(
+        conn, "a", claim["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"},
+         {"upstream": "y", "digest": "art:y"}], "art:a:NEW")
+    assert status == "accepted"
+    rows = conn.execute(
+        "SELECT upstream_id, kind, read_digest FROM deps WHERE task_id='a' "
+        "ORDER BY upstream_id").fetchall()
+    assert [(r["upstream_id"], r["kind"], r["read_digest"]) for r in rows] == \
+        [("x", "static", "art:x"), ("y", "dynamic", "art:y")]
+    # a later run drops y and keeps reading x: dynamic set reflects this run
+    claim2 = None
+    conn.execute(
+        "UPDATE tasks SET source_digest='src:a:v3', state='executable', "
+        "reason='source_changed', reason_task_id=NULL, depth=0 WHERE task_id='a'")
+    claim2, err = core.claim(conn, "a")
+    assert err is None
+    status, _ = core.report_result(
+        conn, "a", claim2["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"}], "art:a:NEW2")
+    assert status == "accepted"
+    rows = conn.execute(
+        "SELECT upstream_id, kind FROM deps WHERE task_id='a' "
+        "ORDER BY upstream_id").fetchall()
+    assert [(r["upstream_id"], r["kind"]) for r in rows] == [("x", "static")]
+
+
+def test_new_unsettled_dynamic_read_keeps_task_waiting():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("y", src_v=2, prev_src_v=1),                       # not settled
+        task("a", src_v=2, prev_src_v=1),
+    ])
+    claim, _ = core.claim(conn, "a")
+    # the digest is the one y has currently registered, so the read itself is
+    # legal; but y is still executable -> a must wait rather than go reusable
+    status, _ = core.report_result(
+        conn, "a", claim["input_fingerprint"],
+        [{"upstream": "y", "digest": "art:y"}], "art:a:NEW")
+    assert status == "accepted"
+    assert states(conn)["a"] == "waiting"
+    row = conn.execute(
+        "SELECT reason, reason_task_id, depth FROM tasks WHERE task_id='a'"
+    ).fetchone()
+    assert row["reason"] == "upstream_waiting"
+    assert row["reason_task_id"] == "y"
+    # once y settles with the same artifact a was built against, a is reusable
+    claim_y, _ = core.claim(conn, "y")
+    status, _ = core.report_result(conn, "y", claim_y["input_fingerprint"],
+                                   [], "art:y")
+    assert status == "accepted"
+    assert states(conn)["a"] == "reusable"
+
+
+def test_reporting_waiting_task_is_stale():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("a", src_v=2, prev_src_v=1), task("b", ["a"]),
+    ])
+    # b is waiting; a report arriving for it (with any fingerprint) is stale
+    fp = core.input_fingerprint(
+        conn.execute("SELECT def_hash FROM tasks WHERE task_id='b'").fetchone()[0],
+        conn.execute(
+            "SELECT source_digest FROM tasks WHERE task_id='b'").fetchone()[0],
+        [("a", "art:a")])
+    status, detail = core.report_result(conn, "b", fp, [], "art:b:NEW")
+    assert status == "stale"
+    assert detail["state"] == "waiting"
+    assert states(conn)["b"] == "waiting"
+
+
+def test_missing_dependency_rolls_back_with_static_overlap():
+    conn, _ = fresh_conn()
+    core.import_graph(conn, [
+        task("x"),
+        task("a", ["x"], src_v=2, prev_src_v=1),
+    ])
+    claim, _ = core.claim(conn, "a")
+    status, detail = core.report_result(
+        conn, "a", claim["input_fingerprint"],
+        [{"upstream": "x", "digest": "art:x"},
+         {"upstream": "ghost", "digest": "z"}], "art:a:NEW")
+    assert status == "missing_dependency"
+    assert detail["missing"] == ["ghost"]
+    # whole report rolled back: static digest untouched, no dynamic rows
+    rows = conn.execute(
+        "SELECT upstream_id, kind, read_digest FROM deps WHERE task_id='a'"
+    ).fetchall()
+    assert [(r["upstream_id"], r["kind"], r["read_digest"]) for r in rows] == \
+        [("x", "static", "art:x")]
+    assert states(conn)["a"] == "executable"
 
 
 def test_cycle_report_rolls_back():

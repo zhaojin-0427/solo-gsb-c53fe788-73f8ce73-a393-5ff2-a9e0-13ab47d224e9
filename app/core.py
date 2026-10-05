@@ -328,7 +328,25 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
     """Apply one execution report atomically.
 
     Returns ``(status, detail)`` where status is "accepted", "stale" or one of
-    the error codes.  Any failure rolls the whole report back.
+    the error codes.  A report is only valid when *all* of the following hold:
+
+    * the task is currently ``executable`` -- a result arriving for a task that
+      was already settled is a stale replay, even when its fingerprint is still
+      byte-identical (the first report can leave the fingerprint unchanged);
+    * the carried fingerprint equals the fingerprint of the task's current
+      definition, source digest and registered upstream artifacts;
+    * every reported read names an existing task *and* its digest equals that
+      task's currently registered artifact (reads are facts, not claims -- a
+      wrong digest means the worker saw something no longer registered).
+
+    Stale reports are rejected with no side effect: the task, its deps,
+    downstream verdicts and the change sequence are all untouched.  Missing
+    dependencies or a dependency cycle roll the whole report back.
+
+    Read/dep merging on an accepted report: the actual reads replace the
+    dynamic dep set; a read whose key is a declared static dep keeps its
+    ``static`` identity and merely has its historical read digest refreshed,
+    so a static edge can never be duplicated as a dynamic row.
     """
     with db.write_lock:
         conn.execute("BEGIN IMMEDIATE")
@@ -338,6 +356,13 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
             if row is None:
                 conn.rollback()
                 return "unknown_task", {"task_id": task_id}
+
+            # a result is only meaningful for a task that is still runnable;
+            # re-reporting an already settled task (reusable/waiting) is stale
+            # regardless of the fingerprint it carries.
+            if row["state"] != EXECUTABLE:
+                conn.rollback()
+                return "stale", {"task_id": task_id, "state": row["state"]}
 
             deps = conn.execute(
                 "SELECT d.upstream_id, t.artifact_digest FROM deps d "
@@ -351,43 +376,76 @@ def report_result(conn, task_id, fingerprint, reads, artifact_digest):
                 return "stale", {"task_id": task_id,
                                  "current_fingerprint": current_fp}
 
-            # validate newly discovered dynamic dependencies
+            # normalise the actually-read set (last write wins on duplicates)
             new_reads = {}
             for r in reads:
                 up = str(r["upstream"])
                 new_reads[up] = str(r.get("digest", ""))
+
             if new_reads:
                 marks = ",".join("?" * len(new_reads))
-                found = {r[0] for r in conn.execute(
-                    f"SELECT task_id FROM tasks WHERE task_id IN ({marks})",
-                    tuple(new_reads))}
+                found_rows = conn.execute(
+                    f"SELECT task_id, artifact_digest FROM tasks "
+                    f"WHERE task_id IN ({marks})", tuple(new_reads)).fetchall()
+                found = {r["task_id"] for r in found_rows}
                 missing = sorted(set(new_reads) - found)
                 if missing:
                     conn.rollback()
                     return "missing_dependency", {"missing": missing}
 
-            # swap dynamic deps for the actually-read set
+                # the reported digest must equal the upstream's currently
+                # registered artifact; anything else is a stale/wrong read.
+                actual = {r["task_id"]: r["artifact_digest"] for r in found_rows}
+                mismatched = sorted(up for up, digest in new_reads.items()
+                                    if actual[up] != digest)
+                if mismatched:
+                    conn.rollback()
+                    return "stale", {"task_id": task_id,
+                                     "mismatched_reads": mismatched}
+
+            # ---- merge reads into the dep graph -----------------------------
+            # static keys read this run keep their static identity and just
+            # get their historical digest refreshed; other reads form the new
+            # dynamic set, replacing whatever the previous execution found.
+            static_keys = {r[0] for r in conn.execute(
+                "SELECT upstream_id FROM deps WHERE task_id=? AND kind='static'",
+                (task_id,))}
+            static_reads = sorted(static_keys & set(new_reads))
+            dynamic_reads = [(up, new_reads[up]) for up in sorted(new_reads)
+                             if up not in static_keys]
+
             conn.execute(
                 "DELETE FROM deps WHERE task_id=? AND kind='dynamic'", (task_id,))
             conn.executemany(
                 "INSERT INTO deps(task_id, upstream_id, kind, read_digest) "
                 "VALUES (?,?, 'dynamic', ?)",
-                [(task_id, up, digest) for up, digest in new_reads.items()])
+                [(task_id, up, digest) for up, digest in dynamic_reads])
+            conn.executemany(
+                "UPDATE deps SET read_digest=? "
+                "WHERE task_id=? AND upstream_id=? AND kind='static'",
+                [(new_reads[up], task_id, up) for up in static_reads])
 
             if new_reads and _creates_cycle(conn, task_id):
                 conn.rollback()
                 return "cycle", {"task_id": task_id}
 
-            # the task itself is now up to date with what it read
-            log = _ChangeLog(conn)
+            # the execution consumed the task's current definition/sources and
+            # produced a new artifact
             conn.execute(
                 "UPDATE tasks SET artifact_digest=?, prev_def_hash=def_hash, "
                 "                prev_source_digest=source_digest "
                 "WHERE task_id=?", (artifact_digest, task_id))
+
+            # re-adjudicate the task itself against what it actually read:
+            # normally reusable, but a newly discovered unsettled dynamic
+            # upstream keeps it waiting until that upstream settles.
+            log = _ChangeLog(conn)
             fresh = conn.execute(
-                "SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-            if fresh["state"] != REUSABLE:
-                log.record(task_id, fresh["state"], REUSABLE, None, None, 0)
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            verdict = _decide(_self_reason(fresh), _fetch_upstreams(conn, task_id))
+            if verdict != (fresh["state"], fresh["reason"],
+                           fresh["reason_task_id"], fresh["depth"]):
+                log.record(task_id, fresh["state"], *verdict)
 
             # propagate the verdict to downstream tasks
             _propagate(conn, log, [task_id])

@@ -105,5 +105,7 @@ def report(payload: dict = Body(...)):
     except (KeyError, TypeError):
         return JSONResponse({"status": "error", "error": "invalid_payload"}, 400)
     status, detail = core.report_result(conn(), task_id, fingerprint, reads, artifact)
+    if status == "unknown_task":
+        return JSONResponse({"status": status, **detail}, 404)
     code = {"accepted": 200, "stale": 409}.get(status, 400)
     return JSONResponse({"status": status, **detail}, code)
